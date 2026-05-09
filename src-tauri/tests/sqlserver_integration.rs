@@ -499,3 +499,53 @@ async fn routines() {
 
     exec_sql(&d, &p, "DROP PROCEDURE dbo.__tab_test_proc").await;
 }
+
+// ─── EXPLAIN (SHOWPLAN_XML) ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn explain_query_estimated() {
+    let d = drv();
+    let p = test_params();
+
+    exec_sql(&d, &p, "\
+        IF OBJECT_ID('dbo.__tab_test_explain', 'U') IS NOT NULL DROP TABLE dbo.__tab_test_explain; \
+        CREATE TABLE dbo.__tab_test_explain (id INT PRIMARY KEY, name NVARCHAR(100))").await;
+
+    let plan = d
+        .explain_query(&p, "SELECT * FROM dbo.__tab_test_explain WHERE id = 1", false, Some("dbo"))
+        .await
+        .expect("explain failed");
+
+    assert_eq!(plan.driver, "sqlserver");
+    assert!(!plan.has_analyze_data);
+    assert!(plan.raw_output.is_some());
+    let xml = plan.raw_output.unwrap();
+    assert!(xml.contains("ShowPlanXML"), "Expected SHOWPLAN_XML output: {}", &xml[..100.min(xml.len())]);
+
+    // Should have at least one RelOp node parsed
+    assert!(!plan.root.node_type.is_empty() || !plan.root.children.is_empty(),
+        "Plan tree should have nodes");
+
+    exec_sql(&d, &p, "DROP TABLE dbo.__tab_test_explain").await;
+}
+
+#[tokio::test]
+async fn explain_query_analyze() {
+    let d = drv();
+    let p = test_params();
+
+    exec_sql(&d, &p, "\
+        IF OBJECT_ID('dbo.__tab_test_analyze', 'U') IS NOT NULL DROP TABLE dbo.__tab_test_analyze; \
+        CREATE TABLE dbo.__tab_test_analyze (id INT PRIMARY KEY, name NVARCHAR(100)); \
+        INSERT INTO dbo.__tab_test_analyze VALUES (1, 'test')").await;
+
+    let plan = d
+        .explain_query(&p, "SELECT * FROM dbo.__tab_test_analyze WHERE id = 1", true, Some("dbo"))
+        .await
+        .expect("analyze failed");
+
+    assert_eq!(plan.driver, "sqlserver");
+    assert!(plan.has_analyze_data);
+
+    exec_sql(&d, &p, "DROP TABLE dbo.__tab_test_analyze").await;
+}
