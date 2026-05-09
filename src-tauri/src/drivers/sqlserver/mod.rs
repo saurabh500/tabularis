@@ -479,6 +479,9 @@ mod tests {
             ssh_key_passphrase: None,
             save_in_keychain: None,
             connection_id: None,
+            trust_server_certificate: None,
+            encrypt: None,
+            auth_mode: None,
         }
     }
 
