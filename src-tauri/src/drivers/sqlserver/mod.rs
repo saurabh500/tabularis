@@ -435,20 +435,15 @@ impl DatabaseDriver for SqlServerDriver {
 
         let sql = if inserting_identity {
             format!(
-                "SET IDENTITY_INSERT {} ON; {}; SET IDENTITY_INSERT {} OFF",
+                "SET IDENTITY_INSERT {} ON; {}; SELECT @@ROWCOUNT AS cnt; SET IDENTITY_INSERT {} OFF",
                 fqn, sql, fqn
             )
         } else {
-            sql
+            format!("{}; SELECT @@ROWCOUNT AS cnt", sql)
         };
 
-        conn.simple_query(&sql)
-            .await
-            .map_err(|e| e.to_string())?;
-        // Workaround: execute() returns 0 (mssql-tiberius-bridge#1).
-        // Use @@ROWCOUNT via a follow-up query.
         let rows = conn
-            .simple_query("SELECT @@ROWCOUNT AS cnt")
+            .simple_query(&sql)
             .await
             .map_err(|e| e.to_string())?
             .into_first_result();
@@ -471,7 +466,7 @@ impl DatabaseDriver for SqlServerDriver {
         let fqn = helpers::qualify(schema, table);
 
         let sql = format!(
-            "UPDATE {} SET {} = {} WHERE {} = {}",
+            "UPDATE {} SET {} = {} WHERE {} = {}; SELECT @@ROWCOUNT AS cnt",
             fqn,
             helpers::bracket_quote(col_name),
             json_to_sql_literal(&new_val),
@@ -479,11 +474,8 @@ impl DatabaseDriver for SqlServerDriver {
             json_to_sql_literal(&pk_val),
         );
 
-        conn.simple_query(&sql)
-            .await
-            .map_err(|e| e.to_string())?;
         let rows = conn
-            .simple_query("SELECT @@ROWCOUNT AS cnt")
+            .simple_query(&sql)
             .await
             .map_err(|e| e.to_string())?
             .into_first_result();
@@ -503,17 +495,14 @@ impl DatabaseDriver for SqlServerDriver {
         let fqn = helpers::qualify(schema, table);
 
         let sql = format!(
-            "DELETE FROM {} WHERE {} = {}",
+            "DELETE FROM {} WHERE {} = {}; SELECT @@ROWCOUNT AS cnt",
             fqn,
             helpers::bracket_quote(pk_col),
             json_to_sql_literal(&pk_val),
         );
 
-        conn.simple_query(&sql)
-            .await
-            .map_err(|e| e.to_string())?;
         let rows = conn
-            .simple_query("SELECT @@ROWCOUNT AS cnt")
+            .simple_query(&sql)
             .await
             .map_err(|e| e.to_string())?
             .into_first_result();
