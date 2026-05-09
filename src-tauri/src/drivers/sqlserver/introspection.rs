@@ -173,6 +173,13 @@ WHERE i.object_id = OBJECT_ID(@P1) \
   AND i.name IS NOT NULL \
 ORDER BY i.name, ic.key_ordinal";
 
+pub const Q_GET_IDENTITY_COLUMNS: &str = "\
+SELECT c.name AS column_name \
+FROM sys.columns c \
+JOIN sys.tables t ON c.object_id = t.object_id \
+JOIN sys.schemas s ON t.schema_id = s.schema_id \
+WHERE c.is_identity = 1 AND s.name = @P1 AND t.name = @P2";
+
 // --- Pure SQL Server type helpers ----------------------------------------
 
 /// Column names whose `max_length` in `sys.columns` measures bytes, not chars.
@@ -560,6 +567,25 @@ pub async fn get_indexes(
             is_primary: row_bool(&r, "is_primary"),
             seq_in_index: row_i32(&r, "seq_in_index"),
         })
+        .collect())
+}
+
+/// Return the set of identity column names for a given table.
+pub async fn get_identity_columns(
+    conn: &mut BridgeConnection,
+    table: &str,
+    schema: Option<&str>,
+) -> Result<std::collections::HashSet<String>, String> {
+    let schema = schema.unwrap_or("dbo");
+    let rows = conn
+        .query(Q_GET_IDENTITY_COLUMNS, &[&schema, &table])
+        .await
+        .map_err(|e| e.to_string())?
+        .into_first_result();
+
+    Ok(rows
+        .into_iter()
+        .map(|r| row_str(&r, "column_name"))
         .collect())
 }
 

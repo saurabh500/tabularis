@@ -1,9 +1,4 @@
 //! Microsoft SQL Server driver (built-in).
-//!
-//! Phase 1 scope: read-only preview. `DriverCapabilities.readonly = true`
-//! keeps the UI from calling CRUD routes; the trait still requires the methods
-//! to exist, so the unimplemented ones return a descriptive error until later
-//! days fill them in.
 
 pub mod extract;
 pub mod helpers;
@@ -24,6 +19,24 @@ use crate::models::{
 };
 use crate::pool_manager::get_sqlserver_pool;
 
+/// Convert a `serde_json::Value` into a SQL Server literal for use in
+/// simple (non-parameterized) queries. Strings are escaped by doubling
+/// single quotes.
+fn json_to_sql_literal(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "NULL".to_string(),
+        serde_json::Value::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => {
+            format!("N'{}'", s.replace('\'', "''"))
+        }
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            let json_str = serde_json::to_string(v).unwrap_or_default();
+            format!("N'{}'", json_str.replace('\'', "''"))
+        }
+    }
+}
+
 /// Built-in SQL Server driver. Backed by `mssql-tiberius-bridge` + `deadpool`.
 pub struct SqlServerDriver {
     manifest: PluginManifest,
@@ -36,7 +49,7 @@ impl SqlServerDriver {
                 id: "sqlserver".to_string(),
                 name: "SQL Server".to_string(),
                 version: "0.1.0".to_string(),
-                description: "Microsoft SQL Server (read-only preview)".to_string(),
+                description: "Microsoft SQL Server".to_string(),
                 default_port: Some(1433),
                 capabilities: DriverCapabilities {
                     schemas: true,
@@ -57,7 +70,7 @@ impl SqlServerDriver {
                     create_foreign_keys: false,
                     no_connection_required: false,
                     manage_tables: false,
-                    readonly: true,
+                    readonly: false,
                 },
                 is_builtin: true,
                 default_username: "sa".to_string(),
@@ -384,42 +397,128 @@ impl DatabaseDriver for SqlServerDriver {
         })
     }
 
-    // --- CRUD (disabled by readonly=true in manifest) -----------------------
+    // --- CRUD ---------------------------------------------------------------
 
     async fn insert_record(
         &self,
-        _params: &ConnectionParams,
-        _table: &str,
-        _data: HashMap<String, serde_json::Value>,
-        _schema: Option<&str>,
+        params: &ConnectionParams,
+        table: &str,
+        data: HashMap<String, serde_json::Value>,
+        schema: Option<&str>,
         _max_blob_size: u64,
     ) -> Result<u64, String> {
-        Err("SQL Server: INSERT disabled in Phase 1 read-only preview".into())
+        let mut conn = acquire(params).await?;
+        let fqn = helpers::qualify(schema, table);
+
+        // Check for identity columns
+        let identity_cols = introspection::get_identity_columns(&mut conn, table, schema).await?;
+        let inserting_identity = data.keys().any(|k| identity_cols.contains(k));
+
+        let mut cols = Vec::new();
+        let mut vals = Vec::new();
+
+        for (k, v) in &data {
+            cols.push(helpers::bracket_quote(k));
+            vals.push(json_to_sql_literal(v));
+        }
+
+        let sql = if cols.is_empty() {
+            format!("INSERT INTO {} DEFAULT VALUES", fqn)
+        } else {
+            format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                fqn,
+                cols.join(", "),
+                vals.join(", ")
+            )
+        };
+
+        let sql = if inserting_identity {
+            format!(
+                "SET IDENTITY_INSERT {} ON; {}; SET IDENTITY_INSERT {} OFF",
+                fqn, sql, fqn
+            )
+        } else {
+            sql
+        };
+
+        conn.simple_query(&sql)
+            .await
+            .map_err(|e| e.to_string())?;
+        // Workaround: execute() returns 0 (mssql-tiberius-bridge#1).
+        // Use @@ROWCOUNT via a follow-up query.
+        let rows = conn
+            .simple_query("SELECT @@ROWCOUNT AS cnt")
+            .await
+            .map_err(|e| e.to_string())?
+            .into_first_result();
+        let count: i32 = rows.first().and_then(|r| r.get(0)).unwrap_or(0);
+        Ok(count as u64)
     }
 
     async fn update_record(
         &self,
-        _params: &ConnectionParams,
-        _table: &str,
-        _pk_col: &str,
-        _pk_val: serde_json::Value,
-        _col_name: &str,
-        _new_val: serde_json::Value,
-        _schema: Option<&str>,
+        params: &ConnectionParams,
+        table: &str,
+        pk_col: &str,
+        pk_val: serde_json::Value,
+        col_name: &str,
+        new_val: serde_json::Value,
+        schema: Option<&str>,
         _max_blob_size: u64,
     ) -> Result<u64, String> {
-        Err("SQL Server: UPDATE disabled in Phase 1 read-only preview".into())
+        let mut conn = acquire(params).await?;
+        let fqn = helpers::qualify(schema, table);
+
+        let sql = format!(
+            "UPDATE {} SET {} = {} WHERE {} = {}",
+            fqn,
+            helpers::bracket_quote(col_name),
+            json_to_sql_literal(&new_val),
+            helpers::bracket_quote(pk_col),
+            json_to_sql_literal(&pk_val),
+        );
+
+        conn.simple_query(&sql)
+            .await
+            .map_err(|e| e.to_string())?;
+        let rows = conn
+            .simple_query("SELECT @@ROWCOUNT AS cnt")
+            .await
+            .map_err(|e| e.to_string())?
+            .into_first_result();
+        let count: i32 = rows.first().and_then(|r| r.get(0)).unwrap_or(0);
+        Ok(count as u64)
     }
 
     async fn delete_record(
         &self,
-        _params: &ConnectionParams,
-        _table: &str,
-        _pk_col: &str,
-        _pk_val: serde_json::Value,
-        _schema: Option<&str>,
+        params: &ConnectionParams,
+        table: &str,
+        pk_col: &str,
+        pk_val: serde_json::Value,
+        schema: Option<&str>,
     ) -> Result<u64, String> {
-        Err("SQL Server: DELETE disabled in Phase 1 read-only preview".into())
+        let mut conn = acquire(params).await?;
+        let fqn = helpers::qualify(schema, table);
+
+        let sql = format!(
+            "DELETE FROM {} WHERE {} = {}",
+            fqn,
+            helpers::bracket_quote(pk_col),
+            json_to_sql_literal(&pk_val),
+        );
+
+        conn.simple_query(&sql)
+            .await
+            .map_err(|e| e.to_string())?;
+        let rows = conn
+            .simple_query("SELECT @@ROWCOUNT AS cnt")
+            .await
+            .map_err(|e| e.to_string())?
+            .into_first_result();
+        let count: i32 = rows.first().and_then(|r| r.get(0)).unwrap_or(0);
+        Ok(count as u64)
     }
 
     // --- ER diagram batch ---------------------------------------------------
@@ -492,7 +591,7 @@ mod tests {
         assert_eq!(m.id, "sqlserver");
         assert_eq!(m.default_port, Some(1433));
         assert!(m.is_builtin);
-        assert!(m.capabilities.readonly, "Phase 1 must ship readonly");
+        assert!(!m.capabilities.readonly, "Phase 2 enables editing");
         assert!(
             !m.capabilities.manage_tables,
             "Phase 1 must hide CREATE TABLE UI"
@@ -555,28 +654,41 @@ mod tests {
         assert!(drv.get_data_types().is_empty());
     }
 
-    #[tokio::test]
-    async fn write_operations_error_out_in_phase1() {
-        let drv = SqlServerDriver::new();
-        let params = make_params(Some("localhost"), Some(1433), "master");
+    #[test]
+    fn json_to_sql_literal_handles_types() {
+        use serde_json::json;
+        assert_eq!(json_to_sql_literal(&json!(null)), "NULL");
+        assert_eq!(json_to_sql_literal(&json!(true)), "1");
+        assert_eq!(json_to_sql_literal(&json!(false)), "0");
+        assert_eq!(json_to_sql_literal(&json!(42)), "42");
+        assert_eq!(json_to_sql_literal(&json!(3.14)), "3.14");
+        assert_eq!(json_to_sql_literal(&json!("hello")), "N'hello'");
+        assert_eq!(
+            json_to_sql_literal(&json!("it's")),
+            "N'it''s'"
+        );
+    }
 
-        let insert_err = drv
-            .insert_record(&params, "t", HashMap::new(), None, 0)
-            .await
-            .expect_err("insert must be blocked");
-        assert!(insert_err.contains("read-only"));
+    #[test]
+    fn json_to_sql_literal_escapes_nested_quotes() {
+        use serde_json::json;
+        assert_eq!(
+            json_to_sql_literal(&json!("O'Brien's")),
+            "N'O''Brien''s'"
+        );
+    }
 
-        let delete_err = drv
-            .delete_record(&params, "t", "id", serde_json::json!(1), None)
-            .await
-            .expect_err("delete must be blocked");
-        assert!(delete_err.contains("read-only"));
+    #[test]
+    fn json_to_sql_literal_handles_json_values() {
+        use serde_json::json;
+        let arr = json!([1, 2, 3]);
+        let result = json_to_sql_literal(&arr);
+        assert!(result.starts_with("N'"));
+        assert!(result.ends_with("'"));
 
-        let create_view_err = drv
-            .create_view(&params, "v", "SELECT 1", None)
-            .await
-            .expect_err("create_view must be blocked");
-        assert!(create_view_err.contains("read-only"));
+        let obj = json!({"key": "val"});
+        let result = json_to_sql_literal(&obj);
+        assert!(result.starts_with("N'"));
     }
 }
 
