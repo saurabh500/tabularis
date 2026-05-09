@@ -19,6 +19,130 @@ use crate::models::{
 };
 use crate::pool_manager::get_sqlserver_pool;
 
+/// Parse SQL Server SHOWPLAN_XML or STATISTICS XML into an `ExplainNode` tree.
+///
+/// The XML structure has `<RelOp>` elements as the operator nodes, nested
+/// to form the plan tree. Each `RelOp` has attributes like
+/// `PhysicalOp`, `LogicalOp`, `EstimateRows`, `EstimateCPU`, `EstimateIO`.
+fn parse_showplan_xml(xml: &str) -> Result<crate::models::ExplainNode, String> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+    use std::collections::HashMap;
+
+    let mut reader = Reader::from_str(xml);
+    let mut buf = Vec::new();
+    let mut node_stack: Vec<crate::models::ExplainNode> = Vec::new();
+    let mut node_id: u32 = 0;
+
+    // Push a root node
+    node_stack.push(crate::models::ExplainNode {
+        id: "0".to_string(),
+        node_type: "ShowPlan".to_string(),
+        relation: None,
+        startup_cost: None,
+        total_cost: None,
+        plan_rows: None,
+        actual_rows: None,
+        actual_time_ms: None,
+        actual_loops: None,
+        buffers_hit: None,
+        buffers_read: None,
+        filter: None,
+        index_condition: None,
+        join_type: None,
+        hash_condition: None,
+        extra: HashMap::new(),
+        children: Vec::new(),
+    });
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e))
+                if e.local_name().as_ref() == b"RelOp" =>
+            {
+                node_id += 1;
+                let mut node = crate::models::ExplainNode {
+                    id: node_id.to_string(),
+                    node_type: String::new(),
+                    relation: None,
+                    startup_cost: None,
+                    total_cost: None,
+                    plan_rows: None,
+                    actual_rows: None,
+                    actual_time_ms: None,
+                    actual_loops: None,
+                    buffers_hit: None,
+                    buffers_read: None,
+                    filter: None,
+                    index_condition: None,
+                    join_type: None,
+                    hash_condition: None,
+                    extra: HashMap::new(),
+                    children: Vec::new(),
+                };
+
+                for attr in e.attributes().flatten() {
+                    let key = String::from_utf8_lossy(attr.key.as_ref()).to_string();
+                    let val = String::from_utf8_lossy(&attr.value).to_string();
+                    match key.as_str() {
+                        "PhysicalOp" => node.node_type = val,
+                        "LogicalOp" => {
+                            node.extra
+                                .insert("LogicalOp".into(), serde_json::json!(val));
+                        }
+                        "EstimateRows" => {
+                            node.plan_rows = val.parse().ok();
+                        }
+                        "EstimateCPU" => {
+                            node.extra
+                                .insert("EstimateCPU".into(), serde_json::json!(val));
+                        }
+                        "EstimateIO" => {
+                            node.extra
+                                .insert("EstimateIO".into(), serde_json::json!(val));
+                        }
+                        "EstimatedTotalSubtreeCost" => {
+                            node.total_cost = val.parse().ok();
+                        }
+                        "Parallel" => {
+                            node.extra
+                                .insert("Parallel".into(), serde_json::json!(val == "true"));
+                        }
+                        "NodeId" => {
+                            node.id = val;
+                        }
+                        _ => {}
+                    }
+                }
+
+                // For Empty events (<RelOp ... />), add as child directly
+                if matches!(reader.read_event_into(&mut buf), Ok(Event::End(_))) {
+                    // This was a start+end; treat like we pushed and popped
+                }
+                node_stack.push(node);
+            }
+            Ok(Event::End(ref e)) if e.local_name().as_ref() == b"RelOp" => {
+                if let Some(finished) = node_stack.pop() {
+                    if let Some(parent) = node_stack.last_mut() {
+                        parent.children.push(finished);
+                    } else {
+                        return Ok(finished);
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(format!("XML parse error: {e}")),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    // Return the root node
+    node_stack
+        .pop()
+        .ok_or_else(|| "Empty execution plan".to_string())
+}
+
 /// Convert a `serde_json::Value` into a SQL Server literal for use in
 /// simple (non-parameterized) queries. Strings are escaped by doubling
 /// single quotes.
@@ -322,6 +446,75 @@ impl DatabaseDriver for SqlServerDriver {
     ) -> Result<String, String> {
         let mut conn = acquire(params).await?;
         introspection::get_module_definition(&mut conn, routine_name, schema).await
+    }
+
+    // --- EXPLAIN (SHOWPLAN_XML) ---------------------------------------------
+
+    async fn explain_query(
+        &self,
+        params: &ConnectionParams,
+        query: &str,
+        analyze: bool,
+        _schema: Option<&str>,
+    ) -> Result<crate::models::ExplainPlan, String> {
+        let mut conn = acquire(params).await?;
+
+        // SQL Server uses SET SHOWPLAN_XML ON for estimated plans,
+        // SET STATISTICS XML ON for actual (analyzed) plans.
+        let (plan_on, plan_off) = if analyze {
+            ("SET STATISTICS XML ON", "SET STATISTICS XML OFF")
+        } else {
+            ("SET SHOWPLAN_XML ON", "SET SHOWPLAN_XML OFF")
+        };
+
+        conn.simple_query(plan_on)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let result = conn
+            .simple_query(query)
+            .await
+            .map_err(|e| format!("EXPLAIN query failed: {e}"));
+
+        // Always turn off, even if the query failed
+        let _ = conn.simple_query(plan_off).await;
+
+        let query_result = result?;
+
+        // SHOWPLAN_XML: XML plan is the only result set (query doesn't execute).
+        // STATISTICS XML: query executes normally, XML plan is the LAST result set.
+        let xml: String = if analyze {
+            let all_sets = query_result.into_results();
+            // Find the last result set that has XML content
+            all_sets
+                .iter()
+                .rev()
+                .find_map(|rows| {
+                    rows.first().and_then(|r| {
+                        let val: Option<String> = r.get(0);
+                        val.filter(|s| s.contains("ShowPlanXML"))
+                    })
+                })
+                .ok_or_else(|| "No execution plan returned".to_string())?
+        } else {
+            let rows = query_result.into_first_result();
+            rows.first()
+                .and_then(|r| r.get::<String, _>(0))
+                .ok_or_else(|| "No execution plan returned".to_string())?
+        };
+
+        // Parse the XML into an ExplainPlan tree
+        let root = parse_showplan_xml(&xml)?;
+
+        Ok(crate::models::ExplainPlan {
+            root,
+            planning_time_ms: None,
+            execution_time_ms: None,
+            original_query: query.to_string(),
+            driver: "sqlserver".to_string(),
+            has_analyze_data: analyze,
+            raw_output: Some(xml),
+        })
     }
 
     // --- Query execution ---------------------------------------------------
